@@ -4,6 +4,13 @@ const app = express();
 app.use(express.json());
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+app.get("/", (req, res) => {
+  res.status(200).send("OK");
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).send("healthy");
+});
 
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
