@@ -2,111 +2,148 @@ import express from "express";
 import OpenAI from "openai";
 
 const app = express();
-app.use(express.json({ verify: (req, res, buf) => (req.rawBody = buf) }));
 
-// ENV
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+// IMPORTANT: Meta sends JSON, we must parse it
+app.use(express.json({ limit: "2mb" }));
+
+const PORT = process.env.PORT || 3000;
+
+// ====== ENV VARS (Railway Variables) ======
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;          // must match Meta "Verify token"
+const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN; // IG/Page token used to reply
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;       // your OpenAI secret key
 
 if (!VERIFY_TOKEN || !PAGE_ACCESS_TOKEN || !OPENAI_API_KEY) {
-  console.log("Missing env vars. Need: VERIFY_TOKEN, PAGE_ACCESS_TOKEN, OPENAI_API_KEY");
+  console.warn("⚠️ Missing env vars. Please set VERIFY_TOKEN, PAGE_ACCESS_TOKEN, OPENAI_API_KEY in Railway.");
 }
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// --- Health check (so /health works) ---
+// ====== Health ======
 app.get("/health", (req, res) => res.status(200).send("ok"));
 
-// --- Webhook verification (Meta calls this) ---
+// ====== Webhook Verification (GET) ======
+// Meta calls this when you click "Verify and save"
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("Webhook verified ✅");
+    console.log("✅ Webhook verified");
     return res.status(200).send(challenge);
   }
+
+  console.log("❌ Webhook verify failed");
   return res.sendStatus(403);
 });
 
-// --- Main webhook receiver ---
+// ====== Helpers ======
+function normalizeText(t = "") {
+  return String(t).trim();
+}
+
+async function generateReplyWithOpenAI(commentText) {
+  const text = normalizeText(commentText);
+
+  // Quick rules (optional) before AI
+  if (!text) return "🙏";
+
+  const systemPrompt = `
+You are an Instagram auto-reply assistant for "Kuwait Explorer".
+Rules:
+- Reply in the SAME language as the user's comment (Arabic or English).
+- Keep replies short (1 sentence).
+- If user says "سلام عليكم" or "السلام عليكم" or similar: reply exactly "وعليكم السلام ورحمة الله وبركاته".
+- Be friendly and helpful.
+`;
+
+  const userPrompt = `User comment: ${text}\nWrite the best reply now.`;
+
+  const r = await openai.responses.create({
+    model: "gpt-4.1-mini",
+    input: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
+    ]
+  });
+
+  // openai-node returns output_text helper in many cases
+  const out =
+    (r && typeof r.output_text === "string" && r.output_text.trim()) ||
+    "";
+
+  return out || "❤️";
+}
+
+async function replyToInstagramComment(commentId, message) {
+  // IG comment replies edge:
+  // POST https://graph.facebook.com/vXX.X/{comment-id}/replies?message=...&access_token=...
+  const url = `https://graph.facebook.com/v20.0/${commentId}/replies`;
+
+  const body = new URLSearchParams();
+  body.set("message", message);
+  body.set("access_token", PAGE_ACCESS_TOKEN);
+
+  const resp = await fetch(url, {
+    method: "POST",
+    body
+  });
+
+  const data = await resp.json().catch(() => ({}));
+
+  if (!resp.ok) {
+    console.error("❌ Reply failed:", resp.status, data);
+    throw new Error(`Reply failed: ${resp.status}`);
+  }
+
+  return data;
+}
+
+// ====== Webhook Receiver (POST) ======
 app.post("/webhook", async (req, res) => {
-  // Always respond quickly to Meta
+  // Always ACK fast, then process async
   res.sendStatus(200);
 
   try {
     const body = req.body;
 
-    // Instagram comments webhook payload usually includes entry[].changes[]
-    const entries = body?.entry || [];
-    for (const entry of entries) {
-      const changes = entry?.changes || [];
+    // Log basic
+    console.log("Webhook event:", JSON.stringify(body, null, 2));
+
+    if (body.object !== "instagram" || !Array.isArray(body.entry)) return;
+
+    for (const entry of body.entry) {
+      const changes = entry.changes || [];
       for (const change of changes) {
-        const field = change?.field;
+        const field = change.field;
 
         // We handle comments & live_comments
         if (field !== "comments" && field !== "live_comments") continue;
 
-        const value = change?.value || {};
-        const commentId = value?.id;      // IG comment id
-        const text = value?.text || "";
-        const username = value?.from?.username || "someone";
+        const value = change.value || {};
+        const commentId = value.id;       // this is the IG comment id
+        const commentText = value.text;   // comment text
 
-        if (!commentId || !text) continue;
-
-        console.log(`New comment from @${username}: ${text}`);
-
-        const replyText = await buildReply(text);
-
-        // Post reply to Instagram comment
-        const url = `https://graph.facebook.com/v24.0/${commentId}/replies`;
-        const r = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            message: replyText,
-            access_token: PAGE_ACCESS_TOKEN
-          })
-        });
-
-        const data = await r.json().catch(() => ({}));
-
-        if (!r.ok) {
-          console.log("❌ Reply failed:", r.status, data);
-        } else {
-          console.log("✅ Replied:", replyText);
+        if (!commentId) {
+          console.log("⚠️ Missing comment id in webhook payload.");
+          continue;
         }
+
+        console.log("New comment:", commentText);
+
+        const reply = await generateReplyWithOpenAI(commentText);
+        await replyToInstagramComment(commentId, reply);
+
+        console.log("Replied:", reply);
       }
     }
-  } catch (e) {
-    console.log("Webhook error:", e?.message || e);
+  } catch (err) {
+    console.error("Webhook processing error:", err);
   }
 });
 
-// --- Reply logic ---
-async function buildReply(userText) {
-  const t = (userText || "").toLowerCase().trim();
-
-  // Hard rule for your example
-  if (t.includes("salam") || t.includes("salam alikom") || t.includes("السلام") || t.includes("السلام عليكم")) {
-    return "وعليكم السلام 🤍";
-  }
-
-  // Otherwise use OpenAI
-  // (Keep it short so it fits IG comments nicely)
-  const prompt = `You are an Instagram assistant. Reply in a friendly short way (1 sentence).
-User comment: "${userText}"`;
-
-  const resp = await openai.responses.create({
-    model: "gpt-4.1-mini",
-    input: prompt
-  });
-
-  const out = resp.output_text?.trim();
-  return out && out.length > 0 ? out : "شكراً لك 🤍";
-}
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("Server running on port", port));
+// ====== Start Server ======
+app.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
+});
