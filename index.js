@@ -3,34 +3,39 @@ import express from "express";
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+// ===== HEALTH CHECK =====
+app.get("/health", (req, res) => {
+  res.status(200).send("healthy");
+});
 
-// Health check (IMPORTANT for Railway)
+// ===== ROOT =====
 app.get("/", (req, res) => {
   res.status(200).send("OK");
 });
 
-// Webhook verification (Meta)
+// ===== WEBHOOK VERIFY =====
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("Webhook verified");
     return res.status(200).send(challenge);
   }
 
   return res.sendStatus(403);
 });
 
-// Webhook events
+// ===== WEBHOOK EVENTS =====
 app.post("/webhook", (req, res) => {
   console.log("Webhook event:", JSON.stringify(req.body, null, 2));
   res.sendStatus(200);
 });
 
+// ===== START SERVER =====
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log("Server running on port", PORT);
 });
