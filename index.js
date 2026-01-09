@@ -1,91 +1,112 @@
 import express from "express";
-import fetch from "node-fetch";
+import OpenAI from "openai";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ verify: (req, res, buf) => (req.rawBody = buf) }));
 
+// ENV
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-/* Health check */
-app.get("/health", (req, res) => {
-  res.status(200).send("healthy");
-});
+if (!VERIFY_TOKEN || !PAGE_ACCESS_TOKEN || !OPENAI_API_KEY) {
+  console.log("Missing env vars. Need: VERIFY_TOKEN, PAGE_ACCESS_TOKEN, OPENAI_API_KEY");
+}
 
-/* Webhook verification */
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// --- Health check (so /health works) ---
+app.get("/health", (req, res) => res.status(200).send("ok"));
+
+// --- Webhook verification (Meta calls this) ---
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("Webhook verified ✅");
     return res.status(200).send(challenge);
   }
   return res.sendStatus(403);
 });
 
-/* Receive Instagram events */
+// --- Main webhook receiver ---
 app.post("/webhook", async (req, res) => {
+  // Always respond quickly to Meta
+  res.sendStatus(200);
+
   try {
-    const entry = req.body.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
+    const body = req.body;
 
-    const commentText = value?.text;
-    const commentId = value?.id;
+    // Instagram comments webhook payload usually includes entry[].changes[]
+    const entries = body?.entry || [];
+    for (const entry of entries) {
+      const changes = entry?.changes || [];
+      for (const change of changes) {
+        const field = change?.field;
 
-    if (!commentText || !commentId) {
-      return res.sendStatus(200);
-    }
+        // We handle comments & live_comments
+        if (field !== "comments" && field !== "live_comments") continue;
 
-    console.log("New comment:", commentText);
+        const value = change?.value || {};
+        const commentId = value?.id;      // IG comment id
+        const text = value?.text || "";
+        const username = value?.from?.username || "someone";
 
-    /* Ask OpenAI */
-    const aiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: "Reply in a friendly, fun, luxury Kuwaiti Instagram style. Use Arabic and English."
-          },
-          {
-            role: "user",
-            content: commentText
-          }
-        ]
-      }),
-    });
+        if (!commentId || !text) continue;
 
-    const aiData = await aiResponse.json();
-    const replyText =
-      aiData.choices?.[0]?.message?.content || "❤️";
+        console.log(`New comment from @${username}: ${text}`);
 
-    /* Reply to Instagram comment */
-    await fetch(
-      `https://graph.facebook.com/v19.0/${commentId}/replies?access_token=${PAGE_ACCESS_TOKEN}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: replyText }),
+        const replyText = await buildReply(text);
+
+        // Post reply to Instagram comment
+        const url = `https://graph.facebook.com/v24.0/${commentId}/replies`;
+        const r = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            message: replyText,
+            access_token: PAGE_ACCESS_TOKEN
+          })
+        });
+
+        const data = await r.json().catch(() => ({}));
+
+        if (!r.ok) {
+          console.log("❌ Reply failed:", r.status, data);
+        } else {
+          console.log("✅ Replied:", replyText);
+        }
       }
-    );
-
-    console.log("Replied:", replyText);
-    res.sendStatus(200);
-  } catch (err) {
-    console.error(err);
-    res.sendStatus(200);
+    }
+  } catch (e) {
+    console.log("Webhook error:", e?.message || e);
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+// --- Reply logic ---
+async function buildReply(userText) {
+  const t = (userText || "").toLowerCase().trim();
+
+  // Hard rule for your example
+  if (t.includes("salam") || t.includes("salam alikom") || t.includes("السلام") || t.includes("السلام عليكم")) {
+    return "وعليكم السلام 🤍";
+  }
+
+  // Otherwise use OpenAI
+  // (Keep it short so it fits IG comments nicely)
+  const prompt = `You are an Instagram assistant. Reply in a friendly short way (1 sentence).
+User comment: "${userText}"`;
+
+  const resp = await openai.responses.create({
+    model: "gpt-4.1-mini",
+    input: prompt
+  });
+
+  const out = resp.output_text?.trim();
+  return out && out.length > 0 ? out : "شكراً لك 🤍";
+}
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log("Server running on port", port));
